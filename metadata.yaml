@@ -1,0 +1,6 @@
+name: astrbot_plugin_segmented_reply
+display_name: 分段回复
+desc: 将符合条件的回复按标点或自定义规则拆分，并按配置间隔逐段发送。
+version: 0.1.0
+author: Airi
+astrbot_version: ">=4.27,<5"

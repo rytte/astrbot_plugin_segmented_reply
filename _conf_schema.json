@@ -1,0 +1,87 @@
+{
+  "enable": {
+    "description": "启用分段回复",
+    "type": "bool",
+    "default": false
+  },
+  "settings": {
+    "description": "分段回复设置",
+    "type": "object",
+    "default": {},
+    "items": {
+      "only_llm_result": {
+        "description": "仅对模型生成的回复分段",
+        "type": "bool",
+        "default": true
+      },
+      "interval_method": {
+        "description": "分段间隔算法",
+        "type": "string",
+        "default": "random",
+        "options": ["random", "log"],
+        "labels": ["随机间隔", "对数间隔"]
+      },
+      "interval": {
+        "description": "随机间隔（秒）",
+        "type": "string",
+        "default": "1.5,3.5",
+        "hint": "填写两个逗号分隔的秒数，例如 1.5,3.5；仅随机间隔使用。"
+      },
+      "log_base": {
+        "description": "对数间隔基数",
+        "type": "float",
+        "default": 2.6,
+        "hint": "仅对数间隔使用，必须大于 0 且不能等于 1。"
+      },
+      "words_count_threshold": {
+        "description": "不拆分的文本长度上限",
+        "type": "int",
+        "default": 300,
+        "hint": "长度超过此值的 Plain 文本保持为一段；长度按 Python 字符数计算。"
+      },
+      "split_mode": {
+        "description": "分段方式",
+        "type": "string",
+        "default": "regex",
+        "options": ["regex", "words"],
+        "labels": ["正则表达式", "分段词列表"]
+      },
+      "regex": {
+        "description": "分段正则表达式",
+        "type": "string",
+        "default": "(?>(?<=[A-Za-z])['’](?=[A-Za-z])|\\([^()]*\\)|（[^（）]*）|\\[[^\\[\\]]*\\]|\\{[^{}]*\\}|「[^「」]*」|『[^『』]*』|【[^【】]*】|〔[^〔〕]*〕|《[^《》]*》|〈[^〈〉]*〉|\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|(?<=[A-Za-z])'(?=[A-Za-z])|[^'\\\\])*'|“(?:\\\\.|[^“”\\\\])*”|‘(?:\\\\.|(?<=[A-Za-z])’(?=[A-Za-z])|[^‘’\\\\])*’|[^。？！~()（）\\[\\]{}「」『』【】〔〕《》〈〉\"'“”‘’])*?[。？！~]+|.+\\Z",
+        "condition": {
+          "split_mode": "regex"
+        },
+        "hint": "使用 Python re.findall；默认规则中的 … 由程序在前后都有字母或数字时切分，标点不计；无效表达式会回退到默认标点规则。"
+      },
+      "split_words": {
+        "description": "分段词列表",
+        "type": "list",
+        "default": ["。", "？", "！", "~", "…"],
+        "condition": {
+          "split_mode": "words"
+        },
+        "hint": "words 模式下命中任一词时分段，匹配到的词会从段尾移除。"
+      },
+      "content_cleanup_rule": {
+        "description": "分段后清理正则",
+        "type": "string",
+        "default": "。",
+        "hint": "对每段执行 re.sub(pattern, '', text)，例如 [。？！]。"
+      }
+    }
+  },
+  "ellipsis_optimization": {
+    "description": "省略号拆分优化",
+    "type": "bool",
+    "default": true,
+    "hint": "仅影响正则模式；省略号前后均有字母或数字，且省略号前最近的非空白字符不是标点时才拆分。关闭后默认正则不会因省略号拆分。"
+  },
+  "skip_first_delay": {
+    "description": "跳过首段回复的延迟等待",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后立即发送首段回复，后续段仍按配置的间隔等待。"
+  }
+}
