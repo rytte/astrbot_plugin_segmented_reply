@@ -38,6 +38,22 @@ class SegmentedReplyPlugin(Star):
         settings = config.get("settings")
         if not isinstance(settings, dict) or not settings:
             settings = config
+        raw_acceleration_ratio = settings.get("acceleration_ratio", 1.0)
+        try:
+            self.acceleration_ratio = float(raw_acceleration_ratio)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "settings.acceleration_ratio must be a finite number between 0 and 1"
+            ) from exc
+        if (
+            isinstance(raw_acceleration_ratio, bool)
+            or not math.isfinite(self.acceleration_ratio)
+            or not 0 <= self.acceleration_ratio <= 1
+        ):
+            raise ValueError(
+                "settings.acceleration_ratio must be a finite number between 0 and 1"
+            )
+        self._active_replies: dict[str, set[asyncio.Event]] = {}
         self.only_llm_result = bool(settings.get("only_llm_result", True))
         self.interval_method = settings.get("interval_method", "random")
         if self.interval_method not in {"random", "log"}:
@@ -223,8 +239,10 @@ class SegmentedReplyPlugin(Star):
         if hasattr(event, "_segmented_reply_original_send"):
             return
         original_send = event.send
+        reply_accelerated = False
 
         async def send_segmented(message: MessageChain | None) -> None:
+            nonlocal reply_accelerated
             if message is None or not message.chain:
                 await original_send(message)
                 return
@@ -243,17 +261,53 @@ class SegmentedReplyPlugin(Star):
                 await original_send(message)
                 return
 
-            for index, component in enumerate(components):
-                if index > 0 or not self.skip_first_delay:
-                    await asyncio.sleep(self._component_interval(component))
-                if isinstance(component, Record):
-                    await original_send(message.derive([component]))
-                else:
-                    await original_send(message.derive([*headers, component]))
-                    headers.clear()
+            session_id = event.unified_msg_origin
+            acceleration = asyncio.Event() if self.acceleration_ratio < 1 else None
+            if acceleration is not None:
+                if reply_accelerated:
+                    acceleration.set()
+                self._active_replies.setdefault(session_id, set()).add(acceleration)
+            try:
+                for index, component in enumerate(components):
+                    if index > 0 or not self.skip_first_delay:
+                        interval = self._component_interval(component)
+                        if acceleration is None or interval <= 0:
+                            await asyncio.sleep(interval)
+                        elif acceleration.is_set():
+                            await asyncio.sleep(interval * self.acceleration_ratio)
+                        else:
+                            loop = asyncio.get_running_loop()
+                            deadline = loop.time() + interval
+                            try:
+                                await asyncio.wait_for(
+                                    acceleration.wait(), timeout=interval
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                            else:
+                                remaining = max(0.0, deadline - loop.time())
+                                await asyncio.sleep(remaining * self.acceleration_ratio)
+                    if isinstance(component, Record):
+                        await original_send(message.derive([component]))
+                    else:
+                        await original_send(message.derive([*headers, component]))
+                        headers.clear()
+            finally:
+                if acceleration is not None:
+                    reply_accelerated = reply_accelerated or acceleration.is_set()
+                    active_replies = self._active_replies[session_id]
+                    active_replies.remove(acceleration)
+                    if not active_replies:
+                        del self._active_replies[session_id]
 
         event._segmented_reply_original_send = original_send
         event.send = send_segmented
+
+    @filter.on_waiting_llm_request()
+    async def accelerate_pending_reply(self, event: AstrMessageEvent) -> None:
+        """Shorten pending reply delays before this session queues for the LLM lock."""
+        for acceleration in self._active_replies.get(event.unified_msg_origin, ()):
+            acceleration.set()
 
     @filter.on_decorating_result(priority=-10000)
     async def prepare_segmented_reply(self, event: AstrMessageEvent) -> None:

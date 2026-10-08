@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
@@ -32,6 +33,8 @@ def test_splitter_settings_have_mode_conditions():
     ]
     assert schema["ellipsis_optimization"]["default"] is True
     assert schema["skip_first_delay"]["default"] is True
+    assert settings["acceleration_ratio"]["type"] == "float"
+    assert settings["acceleration_ratio"]["default"] == 1.0
     assert "ellipsis_optimization" not in settings
     assert settings["regex"]["condition"] == {"split_mode": "regex"}
     assert settings["split_words"]["condition"] == {"split_mode": "words"}
@@ -122,12 +125,14 @@ def make_event(
     chain,
     platform="aiocqhttp",
     content_type=ResultContentType.GENERAL_RESULT,
+    session_id="aiocqhttp:FriendMessage:1",
 ):
     result = MessageEventResult(
         chain=chain,
         result_content_type=content_type,
     )
     event = SimpleNamespace(
+        unified_msg_origin=session_id,
         get_result=lambda: result,
         get_platform_name=lambda: platform,
         send=AsyncMock(),
@@ -140,6 +145,7 @@ def test_default_text_length_threshold_is_300():
 
     assert plugin.words_count_threshold == 300
     assert plugin.content_cleanup_rule == "。"
+    assert plugin.acceleration_ratio == 1.0
 
 
 @pytest.mark.asyncio
@@ -289,3 +295,276 @@ async def test_first_segment_delay_can_be_skipped(
 
     assert actions == expected_actions
     assert original_send.await_count == 2
+
+
+@pytest.mark.parametrize("ratio", [0, 0.7, 1])
+def test_acceleration_ratio_accepts_values_between_zero_and_one(ratio):
+    assert make_plugin(acceleration_ratio=ratio).acceleration_ratio == ratio
+
+
+@pytest.mark.parametrize(
+    "ratio",
+    [
+        -0.1,
+        1.1,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        None,
+        "invalid",
+        True,
+        False,
+    ],
+)
+def test_invalid_acceleration_ratio_fails_fast(ratio):
+    with pytest.raises(ValueError, match="settings.acceleration_ratio"):
+        make_plugin(acceleration_ratio=ratio)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ratio", [1, 0.7, 0])
+@pytest.mark.parametrize("interval_method", ["random", "log"])
+async def test_new_messages_scale_pending_delays_without_compounding(
+    monkeypatch, ratio, interval_method
+):
+    plugin = make_plugin(
+        acceleration_ratio=ratio,
+        interval_method=interval_method,
+        interval="4,4",
+        log_base=2,
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(plugin_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(plugin_module.random, "uniform", lambda start, end: start)
+    event, _ = make_event([])
+    incoming, _ = make_event([])
+
+    async def receive_new_messages(message):
+        await plugin.accelerate_pending_reply(incoming)
+        await plugin.accelerate_pending_reply(incoming)
+
+    original_send = event.send
+    original_send.side_effect = receive_new_messages
+    plugin._install_segmented_sender(event)
+
+    await event.send(MessageChain([Plain("first"), Plain("second"), Plain("third")]))
+
+    interval = 4 if interval_method == "random" else 1
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
+        [interval * ratio, interval * ratio]
+    )
+    assert [call.args[0].chain[0].text for call in original_send.await_args_list] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert plugin._active_replies == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ratio", [0.7, 0])
+@pytest.mark.parametrize("skip_first_delay", [True, False])
+async def test_current_wait_scales_only_the_time_still_remaining(
+    monkeypatch, ratio, skip_first_delay
+):
+    plugin = make_plugin(acceleration_ratio=ratio, skip_first_delay=skip_first_delay)
+    monkeypatch.setattr(plugin, "_component_interval", lambda component: 4)
+    sleep = AsyncMock()
+    monkeypatch.setattr(plugin_module.asyncio, "sleep", sleep)
+    clock = SimpleNamespace(now=10.0)
+    clock.time = lambda: clock.now
+    event, _ = make_event([])
+    incoming, _ = make_event([])
+    intervals = []
+
+    async def trigger_acceleration(awaitable, timeout):
+        awaitable.close()
+        intervals.append(timeout)
+        clock.now += 1
+        await plugin.accelerate_pending_reply(incoming)
+        return True
+
+    monkeypatch.setattr(plugin_module.asyncio, "wait_for", trigger_acceleration)
+    original_send = event.send
+    plugin._install_segmented_sender(event)
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(plugin_module.asyncio, "get_running_loop", lambda: clock)
+        await event.send(
+            MessageChain([Plain("first"), Plain("second"), Plain("third")])
+        )
+
+    remaining_intervals = [3 * ratio, 4 * ratio]
+    if not skip_first_delay:
+        remaining_intervals.append(4 * ratio)
+    assert intervals == [4]
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
+        remaining_intervals
+    )
+    assert original_send.await_count == 3
+    assert plugin._active_replies == {}
+
+
+@pytest.mark.asyncio
+async def test_acceleration_does_not_carry_over_to_next_reply(monkeypatch):
+    plugin = make_plugin(acceleration_ratio=0.7)
+    monkeypatch.setattr(plugin, "_component_interval", lambda component: 4)
+    sleep = AsyncMock()
+    monkeypatch.setattr(plugin_module.asyncio, "sleep", sleep)
+    event, _ = make_event([])
+    incoming, _ = make_event([])
+    intervals = []
+
+    async def wait_without_new_message(awaitable, timeout):
+        awaitable.close()
+        intervals.append(timeout)
+        raise asyncio.TimeoutError
+
+    async def receive_new_message(message):
+        await plugin.accelerate_pending_reply(incoming)
+
+    monkeypatch.setattr(plugin_module.asyncio, "wait_for", wait_without_new_message)
+    original_send = event.send
+    original_send.side_effect = receive_new_message
+    plugin._install_segmented_sender(event)
+    message = MessageChain([Plain("first"), Plain("second"), Plain("third")])
+
+    await event.send(message)
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx([2.8, 2.8])
+    assert plugin._active_replies == {}
+
+    original_send.side_effect = None
+    next_event, _ = make_event([])
+    next_original_send = next_event.send
+    plugin._install_segmented_sender(next_event)
+    await plugin.accelerate_pending_reply(incoming)
+    await next_event.send(message)
+
+    assert intervals == [4, 4]
+    assert sleep.await_count == 2
+    assert original_send.await_count == 3
+    assert next_original_send.await_count == 3
+    assert plugin._active_replies == {}
+
+
+@pytest.mark.asyncio
+async def test_acceleration_survives_separate_record_delivery(monkeypatch):
+    plugin = make_plugin(acceleration_ratio=0.7)
+    monkeypatch.setattr(plugin, "_component_interval", lambda component: 4)
+    sleep = AsyncMock()
+    monkeypatch.setattr(plugin_module.asyncio, "sleep", sleep)
+    event, _ = make_event([])
+    incoming, _ = make_event([])
+
+    async def receive_new_message(message):
+        await plugin.accelerate_pending_reply(incoming)
+
+    original_send = event.send
+    original_send.side_effect = receive_new_message
+    plugin._install_segmented_sender(event)
+
+    await event.send(MessageChain([Record(file="audio")]))
+    original_send.side_effect = None
+    await event.send(MessageChain([Plain("first"), Plain("second")]))
+    await plugin.restore_event_send(event)
+
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx([2.8])
+    assert original_send.await_count == 3
+    assert event.send is original_send
+    assert plugin._active_replies == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_session", [False, True])
+async def test_acceleration_interrupts_only_matching_session_waits(
+    monkeypatch, same_session
+):
+    plugin = make_plugin(acceleration_ratio=0)
+    monkeypatch.setattr(plugin, "_component_interval", lambda component: 60)
+    first, _ = make_event([], session_id="session:first")
+    second, _ = make_event(
+        [], session_id="session:first" if same_session else "session:second"
+    )
+    unrelated, _ = make_event([], session_id="session:unrelated")
+    plugin._install_segmented_sender(first)
+    plugin._install_segmented_sender(second)
+    original_wait_for = asyncio.wait_for
+    waits_started = asyncio.Event()
+    waiting_count = 0
+
+    async def watch_wait(awaitable, timeout):
+        nonlocal waiting_count
+        waiting_count += 1
+        if waiting_count == 2:
+            waits_started.set()
+        return await original_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(plugin_module.asyncio, "wait_for", watch_wait)
+    message = MessageChain([Plain("first"), Plain("second")])
+    first_delivery = asyncio.create_task(first.send(message))
+    second_delivery = asyncio.create_task(second.send(message))
+    try:
+        await original_wait_for(waits_started.wait(), timeout=2)
+        await plugin.accelerate_pending_reply(unrelated)
+        assert not first_delivery.done()
+        assert not second_delivery.done()
+
+        await plugin.accelerate_pending_reply(first)
+        await original_wait_for(first_delivery, timeout=2)
+        if not same_session:
+            assert not second_delivery.done()
+            await plugin.accelerate_pending_reply(second)
+        await original_wait_for(second_delivery, timeout=2)
+    finally:
+        for delivery in (first_delivery, second_delivery):
+            if not delivery.done():
+                delivery.cancel()
+        await asyncio.gather(first_delivery, second_delivery, return_exceptions=True)
+
+    assert plugin._active_replies == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("send failed"), asyncio.CancelledError()]
+)
+async def test_sender_releases_acceleration_state_when_send_fails(failure):
+    plugin = make_plugin(acceleration_ratio=0.7)
+    event, _ = make_event([])
+    event.send.side_effect = failure
+    plugin._install_segmented_sender(event)
+
+    with pytest.raises(type(failure)):
+        await event.send(MessageChain([Plain("first"), Plain("second")]))
+
+    assert plugin._active_replies == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wait_releases_acceleration_state(monkeypatch):
+    plugin = make_plugin(acceleration_ratio=0.7)
+    monkeypatch.setattr(plugin, "_component_interval", lambda component: 60)
+    event, _ = make_event([])
+    plugin._install_segmented_sender(event)
+    original_wait_for = asyncio.wait_for
+    wait_started = asyncio.Event()
+
+    async def watch_wait(awaitable, timeout):
+        wait_started.set()
+        return await original_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(plugin_module.asyncio, "wait_for", watch_wait)
+    delivery = asyncio.create_task(
+        event.send(MessageChain([Plain("first"), Plain("second")]))
+    )
+    try:
+        await original_wait_for(wait_started.wait(), timeout=2)
+        delivery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
+    finally:
+        if not delivery.done():
+            delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+
+    assert plugin._active_replies == {}
