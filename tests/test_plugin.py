@@ -26,15 +26,16 @@ def test_splitter_settings_have_mode_conditions():
 
     settings = schema["settings"]["items"]
     assert list(schema) == [
-        "enable",
         "settings",
+        "acceleration_ratio",
         "ellipsis_optimization",
         "skip_first_delay",
     ]
     assert schema["ellipsis_optimization"]["default"] is True
     assert schema["skip_first_delay"]["default"] is True
-    assert settings["acceleration_ratio"]["type"] == "float"
-    assert settings["acceleration_ratio"]["default"] == 1.0
+    assert schema["acceleration_ratio"]["type"] == "float"
+    assert schema["acceleration_ratio"]["default"] == 1.0
+    assert "acceleration_ratio" not in settings
     assert "ellipsis_optimization" not in settings
     assert settings["regex"]["condition"] == {"split_mode": "regex"}
     assert settings["split_words"]["condition"] == {"split_mode": "words"}
@@ -87,7 +88,13 @@ def test_ellipsis_optimization_can_be_disabled():
     assert plugin._split_text("前文……后文。") == ["前文……后文。"]
 
 
-def make_plugin(*, ellipsis_optimization=None, skip_first_delay=None, **overrides):
+def make_plugin(
+    *,
+    ellipsis_optimization=None,
+    skip_first_delay=None,
+    acceleration_ratio=1.0,
+    **overrides,
+):
     settings = {
         "only_llm_result": False,
         "split_mode": "words",
@@ -96,7 +103,10 @@ def make_plugin(*, ellipsis_optimization=None, skip_first_delay=None, **override
         "interval": "0,0",
         **overrides,
     }
-    config = {"enable": True, "settings": settings}
+    config = {
+        "settings": settings,
+        "acceleration_ratio": acceleration_ratio,
+    }
     if ellipsis_optimization is not None:
         config["ellipsis_optimization"] = ellipsis_optimization
     if skip_first_delay is not None:
@@ -111,7 +121,6 @@ def test_legacy_flat_settings_remain_supported():
     plugin = SegmentedReplyPlugin(
         SimpleNamespace(),
         {
-            "enable": True,
             "only_llm_result": False,
             "words_count_threshold": 123,
         },
@@ -146,6 +155,31 @@ def test_default_text_length_threshold_is_300():
     assert plugin.words_count_threshold == 300
     assert plugin.content_cleanup_rule == "。"
     assert plugin.acceleration_ratio == 1.0
+
+
+def test_interval_is_loaded_without_extra_enable_setting():
+    plugin = SegmentedReplyPlugin(
+        SimpleNamespace(), {"settings": {"interval": "2,4"}}
+    )
+
+    assert plugin.interval == [2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_default_config_splits_model_results_without_extra_enable_setting():
+    context = SimpleNamespace(
+        get_config=lambda: {"platform_settings": {"segmented_reply": {"enable": False}}}
+    )
+    plugin = SegmentedReplyPlugin(context, {})
+    event, result = make_event(
+        [Plain("第一段。第二段。")],
+        content_type=ResultContentType.LLM_RESULT,
+    )
+
+    await plugin.prepare_segmented_reply(event)
+
+    assert [part.text for part in result.chain] == ["第一段", "第二段"]
+    assert hasattr(event, "_segmented_reply_original_send")
 
 
 @pytest.mark.asyncio
@@ -302,6 +336,14 @@ def test_acceleration_ratio_accepts_values_between_zero_and_one(ratio):
     assert make_plugin(acceleration_ratio=ratio).acceleration_ratio == ratio
 
 
+def test_acceleration_ratio_reads_top_level_when_settings_are_empty():
+    plugin = SegmentedReplyPlugin(
+        SimpleNamespace(), {"settings": {}, "acceleration_ratio": 0.7}
+    )
+
+    assert plugin.acceleration_ratio == 0.7
+
+
 @pytest.mark.parametrize(
     "ratio",
     [
@@ -317,7 +359,9 @@ def test_acceleration_ratio_accepts_values_between_zero_and_one(ratio):
     ],
 )
 def test_invalid_acceleration_ratio_fails_fast(ratio):
-    with pytest.raises(ValueError, match="settings.acceleration_ratio"):
+    with pytest.raises(
+        ValueError, match="^acceleration_ratio must be a finite number between 0 and 1$"
+    ):
         make_plugin(acceleration_ratio=ratio)
 
 

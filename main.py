@@ -32,18 +32,17 @@ class SegmentedReplyPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.enabled = bool(config.get("enable", False))
         self.ellipsis_optimization = bool(config.get("ellipsis_optimization", True))
         self.skip_first_delay = bool(config.get("skip_first_delay", True))
         settings = config.get("settings")
         if not isinstance(settings, dict) or not settings:
             settings = config
-        raw_acceleration_ratio = settings.get("acceleration_ratio", 1.0)
+        raw_acceleration_ratio = config.get("acceleration_ratio", 1.0)
         try:
             self.acceleration_ratio = float(raw_acceleration_ratio)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "settings.acceleration_ratio must be a finite number between 0 and 1"
+                "acceleration_ratio must be a finite number between 0 and 1"
             ) from exc
         if (
             isinstance(raw_acceleration_ratio, bool)
@@ -51,7 +50,7 @@ class SegmentedReplyPlugin(Star):
             or not 0 <= self.acceleration_ratio <= 1
         ):
             raise ValueError(
-                "settings.acceleration_ratio must be a finite number between 0 and 1"
+                "acceleration_ratio must be a finite number between 0 and 1"
             )
         self._active_replies: dict[str, set[asyncio.Event]] = {}
         self.only_llm_result = bool(settings.get("only_llm_result", True))
@@ -67,19 +66,17 @@ class SegmentedReplyPlugin(Star):
             logger.warning("Invalid segmented-reply log_base; using 2.6")
             self.log_base = 2.6
 
-        self.interval = [1.5, 3.5]
-        if self.enabled:
-            try:
-                raw_interval = str(settings.get("interval", "1.5,3.5"))
-                self.interval = [
-                    float(value) for value in raw_interval.replace(" ", "").split(",")
-                ]
-                if len(self.interval) != 2:
-                    raise ValueError("interval must contain two values")
-            except (TypeError, ValueError) as exc:
-                logger.error("Failed to parse segmented-reply interval: %s", exc)
-                self.interval = [1.5, 3.5]
-            logger.info("Segmented-reply interval: %s", self.interval)
+        try:
+            raw_interval = str(settings.get("interval", "1.5,3.5"))
+            self.interval = [
+                float(value) for value in raw_interval.replace(" ", "").split(",")
+            ]
+            if len(self.interval) != 2:
+                raise ValueError("interval must contain two values")
+        except (TypeError, ValueError) as exc:
+            logger.error("Failed to parse segmented-reply interval: %s", exc)
+            self.interval = [1.5, 3.5]
+        logger.info("Segmented-reply interval: %s", self.interval)
 
         try:
             self.words_count_threshold = int(settings.get("words_count_threshold", 300))
@@ -316,7 +313,7 @@ class SegmentedReplyPlugin(Star):
         Args:
             event: Event containing the complete reply before core decoration.
         """
-        if not self.enabled or self._native_segmentation_enabled():
+        if self._native_segmentation_enabled():
             return
         result = event.get_result()
         if (
